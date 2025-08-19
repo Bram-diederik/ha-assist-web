@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>HA Assist Web Client</title>
+  <style>
+    body { font-family: sans-serif; max-width: 800px; margin: auto; padding: 1em; background: #f6f6f6; }
+    #chat { border: 1px solid #ccc; border-radius: 8px; padding: 1em; height: 400px; overflow-y: auto; background: #fff; }
+    .msg { margin: 0.5em 0; padding: 0.5em 0.75em; border-radius: 12px; max-width: 75%; clear: both; }
+    .user { background: #d0ebff; float: right; text-align: right; }
+    .bot { background: #d3f9d8; float: left; text-align: left; }
+    .system { color: #666; font-size: 0.9em; text-align: center; clear: both; }
+    input, button, select { margin: 0.25em; padding: 0.4em; }
+  </style>
+</head>
+<body>
+  <h1>HA Assist Web Client</h1>
+
+  <div>
+    <label>Host (ip:port): <input id="haurl" placeholder="192.168.5.2:8123"></label>
+    <label>SSL: <input id="ssl" type="checkbox"></label>
+    <label>Token: <input id="hatoken" type="password"></label>
+    <button onclick="saveSettings()">Save</button>
+  </div>
+
+  <div>
+    <button onclick="connectWS()">Connect</button>
+    <label>Agent: <select id="agentSelect" onchange="saveAgent()"></select></label>
+    <label>Language: <select id="langSelect" onchange="saveLanguage()">
+      <option value="en-US">English (US)</option>
+      <option value="en-GB">English (UK)</option>
+      <option value="nl-NL">Dutch</option>
+      <option value="de-DE">German</option>
+      <option value="fr-FR">French</option>
+      <option value="es-ES">Spanish</option>
+    </select></label>
+  </div>
+
+  <div id="chat"></div>
+
+  <div>
+    <input id="text" placeholder="Type your query" style="width:70%"
+           onkeypress="if(event.key === 'Enter'){ sendIntent(); return false; }">
+    <button onclick="sendIntent()">Send</button>
+    <button onclick="startSTT()">🎤 Speak</button>
+  </div>
+
+<script>
+let ws;
+let messageId = 1;
+let conversationId = null;
+let haUrl, haToken, pipelineId;
+let language = "en-US";
+
+function addMsg(text, cls="system") {
+  const chat = document.getElementById("chat");
+  const div = document.createElement("div");
+  div.className = "msg " + cls;
+  div.textContent = text;
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+function saveSettings() {
+  haUrl = document.getElementById("haurl").value;
+  haToken = document.getElementById("hatoken").value;
+  const ssl = document.getElementById("ssl").checked ? "1" : "0";
+  document.cookie = `haUrl=${haUrl}; path=/`;
+  document.cookie = `haToken=${haToken}; path=/`;
+  document.cookie = `ssl=${ssl}; path=/`;
+  addMsg("✅ Settings saved");
+}
+
+function saveAgent() {
+  const sel = document.getElementById("agentSelect");
+  pipelineId = sel.value;
+  document.cookie = `pipelineId=${pipelineId}; path=/`;
+  addMsg("🎯 Agent selected: " + sel.options[sel.selectedIndex].text, "system");
+}
+
+function saveLanguage() {
+  const sel = document.getElementById("langSelect");
+  language = sel.value;
+  document.cookie = `language=${language}; path=/`;
+  addMsg("🌐 Language selected: " + sel.options[sel.selectedIndex].text, "system");
+}
+
+function loadSettings() {
+  const cookies = Object.fromEntries(document.cookie.split("; ").map(c => c.split("=")));
+  if (cookies.haUrl) document.getElementById("haurl").value = cookies.haUrl;
+  if (cookies.haToken) document.getElementById("hatoken").value = cookies.haToken;
+  if (cookies.ssl === "1") document.getElementById("ssl").checked = true;
+  if (cookies.pipelineId) pipelineId = cookies.pipelineId;
+  if (cookies.language) {
+    language = cookies.language;
+    document.getElementById("langSelect").value = language;
+  }
+  haUrl = cookies.haUrl;
+  haToken = cookies.haToken;
+}
+
+function connectWS() {
+  if (!haUrl || !haToken) {
+    addMsg("⚠ Please set Host and Token first");
+    return;
+  }
+  const ssl = document.getElementById("ssl").checked;
+  const protocol = ssl ? "wss" : "ws";
+  const url = `${protocol}://${haUrl}/api/websocket`;
+
+  ws = new WebSocket(url);
+
+  ws.onopen = () => addMsg("🔗 Connected");
+  ws.onmessage = (event) => handleMessage(event.data);
+  ws.onerror = (err) => addMsg("❌ WebSocket error: " + err);
+  ws.onclose = () => addMsg("🔌 Disconnected");
+}
+
+function handleMessage(message) {
+  let data;
+  try { data = JSON.parse(message); } catch (e) { addMsg("Bad JSON: " + message); return; }
+
+  if (data.type === "auth_required") {
+    ws.send(JSON.stringify({ type: "auth", access_token: haToken }));
+
+  } else if (data.type === "auth_ok") {
+    addMsg("✅ Authenticated");
+    ws.send(JSON.stringify({ id: messageId++, type: "assist_pipeline/pipeline/list" }));
+
+  } else if (data.type === "result" && data.success && data.result?.pipelines) {
+    const sel = document.getElementById("agentSelect");
+    sel.innerHTML = "";
+    data.result.pipelines.forEach(p => {
+      const opt = document.createElement("option");
+      opt.value = p.id;
+      opt.textContent = p.name;
+      sel.appendChild(opt);
+    });
+    if (pipelineId) sel.value = pipelineId;
+    else pipelineId = sel.value;
+    addMsg("📋 Agents loaded", "system");
+
+  } else if (data.type === "event" && data.event?.type === "intent-end") {
+    const speech = data.event.data.intent_output.response.speech.plain.speech;
+    conversationId = data.event.data.intent_output.conversation_id;
+    addMsg(speech, "bot");
+    speakTTS(speech);
+
+  } else if (data.type === "error") {
+    addMsg("❌ Error: " + data.message, "system");
+  }
+}
+
+function sendIntent() {
+  const text = document.getElementById("text").value;
+  if (!text) return;
+  addMsg(text, "user");
+  document.getElementById("text").value = "";
+
+  const payload = {
+    id: messageId++,
+    type: "assist_pipeline/run",
+    start_stage: "intent",
+    end_stage: "intent",
+    input: { text: text },
+    conversation_id: conversationId
+  };
+  if (pipelineId) payload.pipeline = pipelineId;
+  ws.send(JSON.stringify(payload));
+}
+
+// ---- TTS ----
+function speakTTS(text) {
+  if ("speechSynthesis" in window) {
+    const utter = new SpeechSynthesisUtterance(text);
+    utter.lang = language;
+    speechSynthesis.speak(utter);
+  }
+}
+
+// ---- STT ----
+function startSTT() {
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SpeechRecognition) {
+    addMsg("⚠ STT not supported in this browser", "system");
+    return;
+  }
+  const recognition = new SpeechRecognition();
+  recognition.lang = language;
+  recognition.interimResults = false;
+  recognition.maxAlternatives = 1;
+
+  recognition.onstart = () => addMsg("🎙 Listening...", "system");
+  recognition.onerror = (e) => addMsg("❌ STT error: " + e.error, "system");
+  recognition.onresult = (event) => {
+    const transcript = event.results[0][0].transcript;
+    document.getElementById("text").value = transcript;
+    sendIntent();
+  };
+  recognition.start();
+}
+
+loadSettings();
+</script>
+</body>
+</html>
